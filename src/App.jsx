@@ -24,6 +24,9 @@ import {
   Mail,
   LogOut,
   AlertTriangle,
+  ListChecks,
+  ShieldAlert,
+  Ban,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -125,14 +128,27 @@ function dayAppointmentsFor(appointments, key) {
   return appointments.filter((a) => a.date === key && a.status !== "cancelado");
 }
 
+function isSlotBookable(date, timeStr) {
+  const [h, m] = timeStr.split(":").map(Number);
+  const slotDateTime = new Date(date.getFullYear(), date.getMonth(), date.getDate(), h, m, 0, 0);
+  return slotDateTime.getTime() > Date.now();
+}
+
 function isDateAvailable(date, pseudoService, appointments) {
   const key = dateKey(date);
   const dayAppts = dayAppointmentsFor(appointments, key);
   const hasFullDayBlock = dayAppts.some((a) => a.fullDay);
   if (hasFullDayBlock) return false;
-  if (pseudoService && pseudoService.fullDay) return dayAppts.length === 0;
+
+  const bookableSlots = TIME_SLOTS.filter((t) => isSlotBookable(date, t));
+  if (bookableSlots.length === 0) return false;
+
+  if (pseudoService && pseudoService.fullDay) {
+    // O atendimento de dia todo começa às 08:00, então só cabe se esse horário ainda não passou.
+    return dayAppts.length === 0 && bookableSlots.includes("08:00");
+  }
   const takenTimes = new Set(dayAppts.map((a) => a.time));
-  return TIME_SLOTS.some((t) => !takenTimes.has(t));
+  return bookableSlots.some((t) => !takenTimes.has(t));
 }
 
 // ---------- DB <-> app shape mapping ----------
@@ -157,6 +173,7 @@ function apptFromRow(r) {
     duration: r.duration_min,
     date: r.appt_date,
     time: r.appt_time,
+    clientId: r.client_id || null,
     clientName: r.client_name,
     clientPhone: r.client_phone,
     notes: r.notes || "",
@@ -288,6 +305,7 @@ export default function App() {
   const [appointments, setAppointments] = useState([]);
   const [view, setView] = useState("client");
   const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(undefined); // undefined=loading, null=none found, object=loaded
 
   const refreshServices = useCallback(async () => {
     const { data, error } = await supabase.from("services").select("*").order("name");
@@ -299,6 +317,20 @@ export default function App() {
     const { data, error } = await supabase.from("appointments").select("*").order("appt_date").order("appt_time");
     if (error) throw error;
     setAppointments((data || []).map(apptFromRow));
+  }, []);
+
+  const refreshProfile = useCallback(async (userId) => {
+    if (!userId) {
+      setProfile(null);
+      return;
+    }
+    setProfile(undefined);
+    const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).maybeSingle();
+    if (error) {
+      setProfile(null);
+      return;
+    }
+    setProfile(data || null);
   }, []);
 
   useEffect(() => {
@@ -316,11 +348,13 @@ export default function App() {
       }
       const { data } = await supabase.auth.getSession();
       setSession(data.session);
+      await refreshProfile(data.session?.user?.id);
       setReady(true);
     })();
 
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, newSession) => {
       setSession(newSession);
+      refreshProfile(newSession?.user?.id);
     });
 
     const servicesChannel = supabase
@@ -338,7 +372,9 @@ export default function App() {
       supabase.removeChannel(servicesChannel);
       supabase.removeChannel(appointmentsChannel);
     };
-  }, [refreshServices, refreshAppointments]);
+  }, [refreshServices, refreshAppointments, refreshProfile]);
+
+  const isAdmin = profile?.role === "admin";
 
   // ---- Service mutations ----
   async function addService(payload) {
@@ -388,6 +424,7 @@ export default function App() {
         duration_min: appt.duration,
         appt_date: appt.date,
         appt_time: appt.time,
+        client_id: session?.user?.id ?? null,
         client_name: appt.clientName,
         client_phone: appt.clientPhone,
         notes: appt.notes,
@@ -436,7 +473,7 @@ export default function App() {
         input::placeholder { color: ${C.textFaint}; }
       `}</style>
       <div style={{ width: "100%", maxWidth: 430, minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column", borderLeft: `1px solid ${C.border}`, borderRight: `1px solid ${C.border}` }}>
-        <Header />
+        <Header isAdmin={isAdmin} onAdminAccess={() => setView("admin")} />
         {loadError && (
           <div style={{ margin: "0 16px", marginTop: 10, padding: "8px 12px", borderRadius: 6, background: C.dangerSoft, color: C.danger, fontSize: 12.5, display: "flex", gap: 8, alignItems: "center" }}>
             <AlertTriangle size={14} /> {loadError}
@@ -445,9 +482,26 @@ export default function App() {
 
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
           {view === "client" ? (
-            <ClientFlow services={services} appointments={appointments} onBook={addAppointment} />
+            <ClientFlow services={services} appointments={appointments} onBook={addAppointment} session={session} profile={profile} />
+          ) : view === "my" ? (
+            !session ? (
+              <ClientAuthGate />
+            ) : (
+              <MyAppointments
+                appointments={appointments}
+                session={session}
+                onCancel={updateAppointmentStatus}
+                onLogout={() => supabase.auth.signOut()}
+              />
+            )
           ) : !session ? (
-            <AdminGate />
+            <AdminLoginGate />
+          ) : profile === undefined ? (
+            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: C.textMuted, gap: 8 }}>
+              <Loader2 size={18} style={{ animation: "spin 1s linear infinite" }} /> Verificando acesso…
+            </div>
+          ) : !isAdmin ? (
+            <RestrictedNotice onLogout={() => supabase.auth.signOut()} />
           ) : (
             <AdminPanel
               services={services}
@@ -462,7 +516,12 @@ export default function App() {
           )}
         </div>
 
-        <BottomNav view={view} setView={setView} pendingCount={appointments.filter((a) => a.status === "pendente").length} />
+        <BottomNav
+          view={view}
+          setView={setView}
+          isAdmin={isAdmin}
+          pendingCount={appointments.filter((a) => a.status === "pendente").length}
+        />
       </div>
     </div>
   );
@@ -483,25 +542,38 @@ function SetupNotice() {
   );
 }
 
-function Header() {
+function Header({ isAdmin, onAdminAccess }) {
   return (
     <div style={{ padding: "18px 20px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 12 }}>
       <div style={{ width: 38, height: 38, borderRadius: 8, background: C.accentSoft, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
         <Car size={20} color={C.accent} />
       </div>
-      <div>
+      <div style={{ flex: 1 }}>
         <div style={{ fontFamily: FONT_HEAD, fontSize: 18.5, fontWeight: 600, color: C.textPrimary, lineHeight: 1.15 }}>AGRC Estética Automotiva</div>
         <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 2 }}>Agende seu carro em poucos toques</div>
       </div>
+      {!isAdmin && (
+        <button
+          onClick={onAdminAccess}
+          title="Acesso administrativo"
+          aria-label="Acesso administrativo"
+          style={{ background: "none", border: "none", color: C.textFaint, cursor: "pointer", padding: 6, flexShrink: 0 }}
+        >
+          <Lock size={14} />
+        </button>
+      )}
     </div>
   );
 }
 
-function BottomNav({ view, setView, pendingCount }) {
+function BottomNav({ view, setView, isAdmin, pendingCount }) {
   const items = [
     { key: "client", label: "Agendar", icon: CalendarCheck2 },
-    { key: "admin", label: "Painel", icon: ClipboardList, badge: pendingCount },
+    { key: "my", label: "Meus agend.", icon: ListChecks },
   ];
+  if (isAdmin) {
+    items.push({ key: "admin", label: "Painel", icon: ClipboardList, badge: pendingCount });
+  }
   return (
     <div style={{ display: "flex", borderTop: `1px solid ${C.border}`, background: C.surface }}>
       {items.map((it) => {
@@ -532,7 +604,7 @@ function BottomNav({ view, setView, pendingCount }) {
 
 const STEP_LABELS = ["Serviços", "Veículo", "Data", "Dados", "Revisão"];
 
-function ClientFlow({ services, appointments, onBook }) {
+function ClientFlow({ services, appointments, onBook, session, profile }) {
   const [step, setStep] = useState(1);
   const [serviceIds, setServiceIds] = useState([]);
   const [vehicle, setVehicle] = useState(null);
@@ -544,6 +616,14 @@ function ClientFlow({ services, appointments, onBook }) {
   const [confirmed, setConfirmed] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
+
+  useEffect(() => {
+    if (profile) {
+      if (profile.full_name && !name) setName(profile.full_name);
+      if (profile.phone && !phone) setPhone(profile.phone);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile]);
 
   const days = useMemo(() => nextWeekdays(10), []);
   const selectedServices = services.filter((s) => serviceIds.includes(s.id));
@@ -560,8 +640,17 @@ function ClientFlow({ services, appointments, onBook }) {
     if (!date) return new Set();
     const key = dateKey(date);
     const dayAppts = dayAppointmentsFor(appointments, key);
-    if (dayAppts.some((a) => a.fullDay)) return new Set(TIME_SLOTS);
-    return new Set(dayAppts.map((a) => a.time));
+    const blocked = new Set();
+    if (dayAppts.some((a) => a.fullDay)) {
+      TIME_SLOTS.forEach((t) => blocked.add(t));
+    } else {
+      dayAppts.forEach((a) => blocked.add(a.time));
+    }
+    // Horários cujo início já passou (relevante quando a data escolhida é hoje) também ficam bloqueados.
+    TIME_SLOTS.forEach((t) => {
+      if (!isSlotBookable(date, t)) blocked.add(t);
+    });
+    return blocked;
   }, [appointments, date]);
 
   useEffect(() => {
@@ -757,6 +846,15 @@ function ClientFlow({ services, appointments, onBook }) {
               <FieldInput icon={Phone} placeholder="WhatsApp (com DDD)" value={phone} onChange={setPhone} />
               <textarea placeholder="Observações sobre o veículo (opcional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} style={{ width: "100%", padding: "12px 14px", borderRadius: 9, border: `1px solid ${C.border}`, background: C.surface, color: C.textPrimary, fontSize: 14, resize: "none", outline: "none" }} />
             </div>
+            {session ? (
+              <div style={{ marginTop: 12, padding: "8px 12px", borderRadius: 6, background: C.successSoft, color: C.success, fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                <Check size={13} /> Esse agendamento vai aparecer em "Meus agendamentos".
+              </div>
+            ) : (
+              <div style={{ marginTop: 12, padding: "8px 12px", borderRadius: 6, background: C.surfaceRaised, color: C.textMuted, fontSize: 12 }}>
+                Dica: crie uma conta na aba "Meus agendamentos" para acompanhar o status por lá.
+              </div>
+            )}
           </div>
         )}
 
@@ -827,10 +925,73 @@ function StepBar({ step }) {
   );
 }
 
-// ---------- Admin login (Supabase Auth) ----------
+// ---------- Admin login (Supabase Auth, login only — accounts are promoted via SQL) ----------
 
-function AdminGate() {
+function AdminLoginGate() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function handleSubmit() {
+    setError("");
+    if (!email.trim() || !password) {
+      setError("Preencha e-mail e senha.");
+      return;
+    }
+    setBusy(true);
+    const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    setBusy(false);
+    if (signInError) setError(signInError.message);
+  }
+
+  return (
+    <div style={{ flex: 1, padding: 24, display: "flex", flexDirection: "column", justifyContent: "center", gap: 18 }}>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ width: 48, height: 48, borderRadius: "50%", background: C.accentSoft, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
+          <Lock size={20} color={C.accent} />
+        </div>
+        <div style={{ fontFamily: FONT_HEAD, fontSize: 19, fontWeight: 600, color: C.textPrimary }}>Entrar no painel</div>
+        <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 4 }}>Área restrita ao administrador da AGRC.</div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <FieldInput icon={Mail} placeholder="E-mail" value={email} onChange={setEmail} type="email" />
+        <FieldInput icon={Lock} placeholder="Senha" value={password} onChange={setPassword} type="password" />
+      </div>
+
+      {error && <div style={{ padding: "8px 12px", borderRadius: 6, background: C.dangerSoft, color: C.danger, fontSize: 12.5, textAlign: "center" }}>{error}</div>}
+
+      <PrimaryButton onClick={handleSubmit} disabled={busy} icon={User}>
+        {busy ? "Aguarde…" : "Entrar"}
+      </PrimaryButton>
+    </div>
+  );
+}
+
+function RestrictedNotice({ onLogout }) {
+  return (
+    <div style={{ flex: 1, padding: 24, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", gap: 14 }}>
+      <div style={{ width: 48, height: 48, borderRadius: "50%", background: C.dangerSoft, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <ShieldAlert size={22} color={C.danger} />
+      </div>
+      <div>
+        <div style={{ fontFamily: FONT_HEAD, fontSize: 18, fontWeight: 600, color: C.textPrimary }}>Acesso restrito</div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginTop: 6, maxWidth: 260 }}>
+          Essa área é exclusiva para o administrador da AGRC. Sua conta não tem essa permissão.
+        </div>
+      </div>
+      <GhostButton icon={LogOut} onClick={onLogout}>Sair dessa conta</GhostButton>
+    </div>
+  );
+}
+
+// ---------- Client account (sign up / login) ----------
+
+function ClientAuthGate() {
   const [mode, setMode] = useState("login"); // login | signup
+  const [fullName, setFullName] = useState("");
+  const [phone, setPhone] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -845,27 +1006,38 @@ function AdminGate() {
       setError("Preencha e-mail e senha.");
       return;
     }
-    setBusy(true);
     if (mode === "signup") {
+      if (!fullName.trim() || !phone.trim()) {
+        setError("Preencha nome e WhatsApp.");
+        return;
+      }
       if (password.length < 6) {
         setError("Use uma senha com pelo menos 6 caracteres.");
-        setBusy(false);
         return;
       }
       if (password !== confirmPassword) {
         setError("As senhas não são iguais.");
-        setBusy(false);
         return;
       }
-      const { error: signUpError } = await supabase.auth.signUp({ email: email.trim(), password });
+      setBusy(true);
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email: email.trim(),
+        password,
+        options: { data: { full_name: fullName.trim(), phone: phone.trim() } },
+      });
+      if (!signUpError && data.session) {
+        // Sessão já ativa (confirmação de e-mail desligada no projeto): garante que o perfil tem nome e telefone.
+        await supabase.from("profiles").update({ full_name: fullName.trim(), phone: phone.trim() }).eq("id", data.user.id);
+      }
       setBusy(false);
       if (signUpError) {
         setError(signUpError.message);
-      } else {
-        setNotice("Conta criada. Se o Supabase pedir confirmação por e-mail, confirme antes de entrar.");
+      } else if (!data.session) {
+        setNotice("Conta criada. Confirme seu e-mail (enviamos um link) e depois entre.");
         setMode("login");
       }
     } else {
+      setBusy(true);
       const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
       setBusy(false);
       if (signInError) setError(signInError.message);
@@ -873,18 +1045,24 @@ function AdminGate() {
   }
 
   return (
-    <div style={{ flex: 1, padding: 24, display: "flex", flexDirection: "column", justifyContent: "center", gap: 18 }}>
+    <div style={{ flex: 1, padding: 24, display: "flex", flexDirection: "column", justifyContent: "center", gap: 16, overflowY: "auto" }}>
       <div style={{ textAlign: "center" }}>
         <div style={{ width: 48, height: 48, borderRadius: "50%", background: C.accentSoft, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}>
           <User size={22} color={C.accent} />
         </div>
-        <div style={{ fontFamily: FONT_HEAD, fontSize: 19, fontWeight: 600, color: C.textPrimary }}>{mode === "signup" ? "Criar conta do painel" : "Entrar no painel"}</div>
+        <div style={{ fontFamily: FONT_HEAD, fontSize: 19, fontWeight: 600, color: C.textPrimary }}>{mode === "signup" ? "Criar conta" : "Entrar"}</div>
         <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 4 }}>
-          {mode === "signup" ? "Só precisa fazer isso uma vez, no primeiro acesso." : "Só quem tem essas credenciais consegue ver e aprovar os agendamentos."}
+          {mode === "signup" ? "Para agendar com seus dados salvos e acompanhar seus serviços." : "Acesse sua conta para ver seus agendamentos."}
         </div>
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {mode === "signup" && (
+          <>
+            <FieldInput icon={User} placeholder="Nome completo" value={fullName} onChange={setFullName} />
+            <FieldInput icon={Phone} placeholder="WhatsApp (com DDD)" value={phone} onChange={setPhone} />
+          </>
+        )}
         <FieldInput icon={Mail} placeholder="E-mail" value={email} onChange={setEmail} type="email" />
         <FieldInput icon={Lock} placeholder="Senha" value={password} onChange={setPassword} type="password" />
         {mode === "signup" && <FieldInput icon={Lock} placeholder="Confirmar senha" value={confirmPassword} onChange={setConfirmPassword} type="password" />}
@@ -898,8 +1076,58 @@ function AdminGate() {
       </PrimaryButton>
 
       <button onClick={() => { setMode(mode === "signup" ? "login" : "signup"); setError(""); setNotice(""); }} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 12.5, cursor: "pointer", textDecoration: "underline" }}>
-        {mode === "signup" ? "Já tem conta? Entrar" : "Primeiro acesso? Criar conta"}
+        {mode === "signup" ? "Já tem conta? Entrar" : "Ainda não tem conta? Criar conta"}
       </button>
+    </div>
+  );
+}
+
+// ---------- Meus agendamentos (cliente autenticado) ----------
+
+function MyAppointments({ appointments, session, onCancel, onLogout }) {
+  const mine = useMemo(
+    () => appointments.filter((a) => a.clientId === session.user.id).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)),
+    [appointments, session.user.id]
+  );
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
+      <div style={{ padding: "16px 20px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <SectionTitle>Meus agendamentos</SectionTitle>
+        <button onClick={onLogout} title="Sair" style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, borderRadius: 8, border: `1px solid ${C.border}`, background: "transparent", color: C.textMuted, cursor: "pointer" }}>
+          <LogOut size={14} />
+        </button>
+      </div>
+      <div style={{ padding: 20 }}>
+        {mine.length === 0 ? (
+          <EmptyNote>Você ainda não tem agendamentos. Vá até a aba "Agendar" para marcar o primeiro.</EmptyNote>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {mine.map((a) => {
+              const meta = STATUS_META[a.status] || STATUS_META.pendente;
+              const v = VEHICLE_TYPES.find((x) => x.id === a.vehicle);
+              const canCancel = a.status === "pendente" || a.status === "confirmado";
+              return (
+                <div key={a.id} style={{ border: `1px solid ${C.border}`, background: C.surface, borderRadius: 10, padding: 13 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div>
+                      <div style={{ fontSize: 12.5, color: C.textMuted }}>{formatDateFull(a.date)} · {a.fullDay ? "08:00 (dia todo)" : a.time}</div>
+                      <div style={{ fontSize: 13.5, fontWeight: 600, color: C.textPrimary, marginTop: 3 }}>{a.services.map((s) => s.name).join(" + ")}</div>
+                      <div style={{ fontSize: 12, color: C.textMuted, marginTop: 3 }}>{v ? v.label : "—"} · {formatMoney(a.price)}</div>
+                    </div>
+                    <Pill tone={meta.tone}>{meta.label}</Pill>
+                  </div>
+                  {canCancel && (
+                    <div style={{ marginTop: 10 }}>
+                      <MiniButton tone="red" icon={Ban} onClick={() => onCancel(a.id, "cancelado")}>Cancelar agendamento</MiniButton>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -908,6 +1136,7 @@ function AdminGate() {
 
 function AdminPanel({ services, appointments, onAddService, onUpdateService, onDeleteService, onUpdateStatus, onDeleteAppointment, onLogout }) {
   const [tab, setTab] = useState("agenda");
+
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto" }}>
@@ -967,9 +1196,10 @@ function AgendaTab({ appointments, onUpdateStatus, onDelete }) {
                     <Pill tone={meta.tone}>{meta.label}</Pill>
                   </div>
                   <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
-                    {a.status === "pendente" && <MiniButton tone="blue" icon={Check} onClick={() => onUpdateStatus(a.id, "confirmado")}>Confirmar</MiniButton>}
+                    {a.status === "pendente" && <MiniButton tone="blue" icon={Check} onClick={() => onUpdateStatus(a.id, "confirmado")}>Aceitar</MiniButton>}
+                    {a.status === "pendente" && <MiniButton tone="red" icon={X} onClick={() => onUpdateStatus(a.id, "cancelado")}>Rejeitar</MiniButton>}
                     {a.status === "confirmado" && <MiniButton tone="green" icon={Check} onClick={() => onUpdateStatus(a.id, "concluido")}>Concluir</MiniButton>}
-                    {(a.status === "pendente" || a.status === "confirmado") && <MiniButton tone="red" icon={X} onClick={() => onUpdateStatus(a.id, "cancelado")}>Cancelar</MiniButton>}
+                    {a.status === "confirmado" && <MiniButton tone="red" icon={X} onClick={() => onUpdateStatus(a.id, "cancelado")}>Cancelar</MiniButton>}
                     <MiniButton tone="muted" icon={Trash2} onClick={() => onDelete(a.id)}>Excluir</MiniButton>
                   </div>
                 </div>
